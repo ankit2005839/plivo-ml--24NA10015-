@@ -1,8 +1,11 @@
 """Custom Byte-Level BPE (BBPE) Tokenizer.
 Fits the interface required by evaluate.py and train.py.
+Highly optimized using dictionary-based frequency counting.
 """
 import json
 import os
+import re
+from collections import Counter
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 VOCAB_PATH = os.path.join(CURRENT_DIR, "vocab.json")
@@ -10,6 +13,7 @@ VOCAB_PATH = os.path.join(CURRENT_DIR, "vocab.json")
 
 class TrainedBBPE:
     def __init__(self, vocab_file=VOCAB_PATH):
+        self.cache = {}
         if os.path.exists(vocab_file):
             with open(vocab_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -27,25 +31,38 @@ class TrainedBBPE:
     def encode(self, text: str) -> list[int]:
         if not text:
             return []
-        ids = list(text.encode("utf-8"))
-        while len(ids) >= 2:
-            pairs = list(zip(ids[:-1], ids[1:]))
-            best_pair = min(pairs, key=lambda p: self.merges.get(p, float('inf')))
-            if best_pair not in self.merges:
-                break
+        
+        # Lossless splitting to utilize word caching and accelerate encoding
+        tokens = re.findall(r'\s+|\w+|[^\w\s]', text)
+        out_ids = []
+        
+        for token in tokens:
+            if token in self.cache:
+                out_ids.extend(self.cache[token])
+                continue
             
-            new_id = self.merges[best_pair]
-            new_ids = []
-            i = 0
-            while i < len(ids):
-                if i < len(ids) - 1 and (ids[i], ids[i+1]) == best_pair:
-                    new_ids.append(new_id)
-                    i += 2
-                else:
-                    new_ids.append(ids[i])
-                    i += 1
-            ids = new_ids
-        return ids
+            ids = list(token.encode("utf-8"))
+            while len(ids) >= 2:
+                pairs = list(zip(ids[:-1], ids[1:]))
+                best_pair = min(pairs, key=lambda p: self.merges.get(p, float('inf')))
+                if best_pair not in self.merges:
+                    break
+                
+                new_id = self.merges[best_pair]
+                new_ids = []
+                i = 0
+                while i < len(ids):
+                    if i < len(ids) - 1 and (ids[i], ids[i+1]) == best_pair:
+                        new_ids.append(new_id)
+                        i += 2
+                    else:
+                        new_ids.append(ids[i])
+                        i += 1
+                ids = new_ids
+            self.cache[token] = ids
+            out_ids.extend(ids)
+            
+        return out_ids
 
     def decode(self, ids: list[int]) -> str:
         raw_bytes = bytearray()
@@ -62,36 +79,51 @@ def train_bpe(text_path, vocab_size=2048, out_path=VOCAB_PATH):
     with open(text_path, "r", encoding="utf-8") as f:
         text = f.read()
     
-    ids = list(text.encode("utf-8"))
+    # Lossless split to keep training memory-efficient
+    tokens = re.findall(r'\s+|\w+|[^\w\s]', text)
+    word_counts = Counter(tuple(t.encode("utf-8")) for t in tokens)
+    
     vocab = {i: bytes([i]) for i in range(256)}
     merges = {}
+    word_symbols = {word: list(word) for word in word_counts.keys()}
     
     num_merges = vocab_size - 256
     for i in range(num_merges):
-        counts = {}
-        for pair in zip(ids[:-1], ids[1:]):
-            counts[pair] = counts.get(pair, 0) + 1
-        if not counts:
+        pair_counts = Counter()
+        for word, count in word_counts.items():
+            symbols = word_symbols[word]
+            for pair in zip(symbols[:-1], symbols[1:]):
+                pair_counts[pair] += count
+                
+        if not pair_counts:
             break
-        best_pair = max(counts, key=counts.get)
-        if counts[best_pair] < 2:
+            
+        best_pair, freq = pair_counts.most_common(1)[0]
+        if freq < 2:
             break
             
         new_id = 256 + i
         merges[best_pair] = new_id
         vocab[new_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
         
-        new_ids = []
-        idx = 0
-        while idx < len(ids):
-            if idx < len(ids) - 1 and (ids[idx], ids[idx+1]) == best_pair:
-                new_ids.append(new_id)
-                idx += 2
-            else:
-                new_ids.append(ids[idx])
-                idx += 1
-        ids = new_ids
+        # Merge symbols in-place
+        new_word_symbols = {}
+        for word, symbols in word_symbols.items():
+            new_symbols = []
+            idx = 0
+            while idx < len(symbols):
+                if idx < len(symbols) - 1 and (symbols[idx], symbols[idx+1]) == best_pair:
+                    new_symbols.append(new_id)
+                    idx += 2
+                else:
+                    new_symbols.append(symbols[idx])
+                    idx += 1
+            new_word_symbols[word] = new_symbols
+        word_symbols = new_word_symbols
         
+        if (i + 1) % 100 == 0 or i == num_merges - 1:
+            print(f"Merged {i+1}/{num_merges} tokens | Current vocab size: {len(vocab)}")
+            
     serializable_merges = {f"{k[0]},{k[1]}": v for k, v in merges.items()}
     serializable_vocab = {str(k): list(v) for k, v in vocab.items()}
     
