@@ -60,24 +60,17 @@ def main():
     assert n <= MAX_PARAMS, f"cap: max {MAX_PARAMS:,} params"
 
     # Configure decoupled optimizer decay strategies
-    decay = set()
-    no_decay = set()
-    whitelist_weight_modules = (torch.nn.Linear,)
-    blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-    for mn, m in model.named_modules():
-        for pn, p in m.named_parameters():
-            fpn = f"{mn}.{pn}" if mn else pn
-            if pn.endswith("bias"):
-                no_decay.add(fpn)
-            elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
-                decay.add(fpn)
-            elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
-                no_decay.add(fpn)
-
-    param_dict = {pn: p for pn in model.named_parameters()}
+    # Filter active parameters
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    
+    # 2D parameters (matmul weights, embedding weights) get decayed.
+    # 1D parameters (biases, LayerNorm scales) do not.
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    
     optim_groups = [
-        {"params": [param_dict[pn][1] for pn in sorted(list(decay))], "weight_decay": 0.1},
-        {"params": [param_dict[pn][1] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        {"params": decay_params, "weight_decay": 0.1},
+        {"params": nodecay_params, "weight_decay": 0.0}
     ]
     opt = torch.optim.AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95))
 
