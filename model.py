@@ -1,22 +1,19 @@
-"""A small GPT in plain PyTorch. Yours to modify or replace entirely —
-attention, SSM, whatever — as long as evaluate.py still works and the
-parameter cap holds.
+"""An optimized GPT implementation featuring weight tying and specialized normalizations.
 """
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class Config:
-    vocab_size = 256      # byte-level tokenizer default
-    block_size = 128
-    n_layer = 4
-    n_head = 4
-    n_embd = 160
+    vocab_size = 2048      # Configured to match our custom BBPE tokenizer size
+    block_size = 256       # Extended context window to capture larger structures
+    n_layer = 3
+    n_head = 6
+    n_embd = 192
     dropout = 0.0
-    tie_weights = False   # <- one of many things worth questioning
+    tie_weights = True     # Drastically saves parameter overhead
 
 
 class SelfAttention(nn.Module):
@@ -45,8 +42,11 @@ class Block(nn.Module):
         self.attn = SelfAttention(cfg)
         self.ln2 = nn.LayerNorm(cfg.n_embd)
         self.mlp = nn.Sequential(
-            nn.Linear(cfg.n_embd, 4 * cfg.n_embd), nn.GELU(),
-            nn.Linear(4 * cfg.n_embd, cfg.n_embd), nn.Dropout(cfg.dropout))
+            nn.Linear(cfg.n_embd, 4 * cfg.n_embd), 
+            nn.GELU(),
+            nn.Linear(4 * cfg.n_embd, cfg.n_embd), 
+            nn.Dropout(cfg.dropout)
+        )
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -64,16 +64,19 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        
         if cfg.tie_weights:
             self.head.weight = self.tok_emb.weight
+            
         self.apply(self._init)
 
     def _init(self, m):
-        # baseline init: plain normal, one std for everything
-        if isinstance(m, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(m.weight, mean=0.0, std=0.05)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
                 nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -84,8 +87,7 @@ class GPT(nn.Module):
         logits = self.head(self.ln_f(x))
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   targets.reshape(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
     def n_params(self):
